@@ -10,10 +10,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from typing import Literal
+import statistics
 
+from einops import rearrange
 import torch
+from timeit import default_timer
 
 from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.nn_utils import cross_entropy
 
 ModelSizeName = Literal["small", "medium", "large", "xl", "2.7B"]
 BenchmarkMode = Literal["forward", "forward-backward"]
@@ -87,18 +91,43 @@ def resolve_config(args: argparse.Namespace) -> BenchmarkConfig:
 
 
 def build_model(config: BenchmarkConfig) -> BasicsTransformerLM:
-    """TODO: Instantiate the assignment-1 Transformer and move it to the target device/dtype."""
-    raise NotImplementedError("Implement model construction here.")
+    """Instantiate the assignment-1 Transformer and move it to the target device/dtype."""
+    spec = MODEL_SPECS[config.model_size]
+    model = BasicsTransformerLM(
+        vocab_size=config.vocab_size,
+        context_length=config.context_length,
+        d_model=spec.d_model,
+        num_layers=spec.num_layers,
+        num_heads=spec.num_heads,
+        d_ff=spec.d_ff,
+        rope_theta=config.rope_theta,
+    )
+    model.to(device=config.device, dtype=config.dtype)
+    return model
 
 
 def make_batch(config: BenchmarkConfig) -> torch.Tensor:
-    """TODO: Create a random integer token batch with shape [batch_size, context_length]."""
-    raise NotImplementedError("Implement random batch creation here.")
+    """Create a random integer token batch with shape [batch_size, context_length]."""
+    batch = torch.randint(
+        low=0,
+        high=config.vocab_size,
+        size=(config.batch_size, config.context_length),
+        device=config.device,
+    )
+    return batch
 
 
 def run_step(model: BasicsTransformerLM, batch: torch.Tensor, config: BenchmarkConfig) -> None:
-    """TODO: Run one benchmark step and synchronize CUDA after the step completes."""
-    raise NotImplementedError("Implement one forward or forward-backward step here.")
+    """Run one benchmark step and synchronize CUDA after the step completes."""
+    x, target = batch[..., :-1], batch[..., 1:]
+    logits = model(x)
+    if config.mode == "forward":
+        model.zero_grad(set_to_none=True)
+        loss = cross_entropy(rearrange(logits, "... sequence_length vocab_size -> ... vocab_size sequence_length"), target)
+        loss.backward()
+    
+    if "cuda" in config.device:
+        torch.cuda.synchronize()
 
 
 def benchmark_steps(
@@ -106,13 +135,36 @@ def benchmark_steps(
     batch: torch.Tensor,
     config: BenchmarkConfig,
 ) -> list[float]:
-    """TODO: Perform warmup, time measurement steps, and return per-step durations in seconds."""
-    raise NotImplementedError("Implement the benchmarking loop here.")
+    """Perform warmup, time measurement steps, and return per-step durations in seconds."""
+    for _ in range(config.warmup_steps):
+        run_step(model, batch, config)
+
+    step_times = []
+    
+    for _ in range(config.measurement_steps):
+        if "cuda" in config.device:
+            torch.cuda.synchronize()
+        
+        start = default_timer()
+        run_step(model, batch, config)
+
+        if "cuda" in config.device:
+            torch.cuda.synchronize()
+        
+        end = default_timer()
+        step_times.append(end - start)
+
+    return step_times
 
 
 def summarize_timings(step_times: list[float]) -> dict[str, float]:
-    """TODO: Compute aggregate statistics such as mean and standard deviation."""
-    raise NotImplementedError("Implement timing aggregation here.")
+    return {
+        "mean": statistics.mean(step_times),
+        "stdev": statistics.stdev(step_times) if len(step_times) > 1 else 0.0,
+        "min": min(step_times),
+        "max": max(step_times),
+    }
+    
 
 
 def main() -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from dataclasses import dataclass
+from pathlib import Path
 import statistics
 from timeit import default_timer
 from typing import Literal
@@ -18,9 +19,10 @@ import torch
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
+from cs336_basics.optimizer import AdamW
 
 ModelSizeName = Literal["small", "medium", "large", "xl", "2.7B"]
-BenchmarkMode = Literal["forward", "forward-backward"]
+BenchmarkMode = Literal["forward", "forward-backward", "train-step"]
 PrecisionName = Literal["float16", "float32", "bfloat16"]
 PrecisionAutocastName = Literal["none", "float16", "bfloat16"]
 
@@ -56,6 +58,9 @@ class BenchmarkConfig:
     device: str
     dtype: torch.dtype
     precision_autocast: torch.dtype | None
+    optimizer_lr: float
+    memory_snapshot_path: str | None
+    report_peak_memory: bool
     seed: int
 
 
@@ -77,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rope-theta", type=float, default=10_000.0)
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measurement-steps", type=int, default=10)
-    parser.add_argument("--mode", choices=("forward", "forward-backward"), default="forward-backward")
+    parser.add_argument("--mode", choices=("forward", "forward-backward", "train-step"), default="forward-backward")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=tuple(DTYPE_MAP), default="float32")
     parser.add_argument(
@@ -85,6 +90,17 @@ def parse_args() -> argparse.Namespace:
         choices=("none", "float16", "bfloat16"),
         default="none",
         help="Autocast dtype for mixed precision. Keep model params in --dtype and cast eligible ops dynamically.",
+    )
+    parser.add_argument("--optimizer-lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--memory-snapshot-path",
+        default=None,
+        help="If set on CUDA, record a memory snapshot for one profiled step and dump it to this pickle path.",
+    )
+    parser.add_argument(
+        "--report-peak-memory",
+        action="store_true",
+        help="If set on CUDA, report peak allocated and reserved memory for one profiled step.",
     )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
@@ -103,6 +119,9 @@ def resolve_config(args: argparse.Namespace) -> BenchmarkConfig:
         device=args.device,
         dtype=DTYPE_MAP[args.dtype],
         precision_autocast=None if args.precision_autocast == "none" else DTYPE_MAP[args.precision_autocast],
+        optimizer_lr=args.optimizer_lr,
+        memory_snapshot_path=args.memory_snapshot_path,
+        report_peak_memory=args.report_peak_memory,
         seed=args.seed,
     )
 
@@ -137,6 +156,12 @@ def build_model(config: BenchmarkConfig) -> BasicsTransformerLM:
     return model
 
 
+def build_optimizer(model: BasicsTransformerLM, config: BenchmarkConfig) -> AdamW | None:
+    if config.mode != "train-step":
+        return None
+    return AdamW(model.parameters(), lr=config.optimizer_lr)
+
+
 def make_batch(config: BenchmarkConfig) -> torch.Tensor:
     """Create a random integer token batch with shape [batch_size, context_length]."""
     batch = torch.randint(
@@ -149,16 +174,25 @@ def make_batch(config: BenchmarkConfig) -> torch.Tensor:
     return batch
 
 
-def run_step(model: BasicsTransformerLM, batch: torch.Tensor, config: BenchmarkConfig) -> None:
+def run_step(
+    model: BasicsTransformerLM,
+    batch: torch.Tensor,
+    config: BenchmarkConfig,
+    optimizer: AdamW | None = None,
+) -> None:
     """Run one benchmark step and synchronize CUDA after the step completes."""
     x, target = batch[..., :-1], batch[..., 1:]
 
-    if config.mode == "forward-backward":
+    if config.mode in {"forward-backward", "train-step"}:
         model.zero_grad(set_to_none=True)
         with autocast_context(config):
             logits = model(x)
             loss = cross_entropy(logits, target)
         loss.backward()
+        if config.mode == "train-step":
+            if optimizer is None:
+                raise ValueError("An optimizer must be provided when mode='train-step'.")
+            optimizer.step()
     else:
         with torch.no_grad():
             with autocast_context(config):
@@ -171,17 +205,18 @@ def benchmark_steps(
     model: BasicsTransformerLM,
     batch: torch.Tensor,
     config: BenchmarkConfig,
+    optimizer: AdamW | None = None,
 ) -> list[float]:
     """Perform warmup, time measurement steps, and return per-step durations in seconds."""
     for _ in range(config.warmup_steps):
-        run_step(model, batch, config)
+        run_step(model, batch, config, optimizer)
 
     step_times = []
 
     for _ in range(config.measurement_steps):
         synchronize(config.device)
         start = default_timer()
-        run_step(model, batch, config)
+        run_step(model, batch, config, optimizer)
         synchronize(config.device)
         end = default_timer()
         step_times.append(end - start)
@@ -196,7 +231,45 @@ def summarize_timings(step_times: list[float]) -> dict[str, float]:
         "min": min(step_times),
         "max": max(step_times),
     }
-    
+
+
+def maybe_profile_memory(
+    model: BasicsTransformerLM,
+    batch: torch.Tensor,
+    config: BenchmarkConfig,
+    optimizer: AdamW | None = None,
+) -> dict[str, float] | None:
+    if config.memory_snapshot_path is None and not config.report_peak_memory:
+        return None
+    if not config.device.startswith("cuda"):
+        raise ValueError("Memory snapshotting and peak-memory reporting are only supported on CUDA devices.")
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+
+    snapshot_path = None
+    if config.memory_snapshot_path is not None:
+        snapshot_path = Path(config.memory_snapshot_path)
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
+
+    try:
+        run_step(model, batch, config, optimizer)
+        torch.cuda.synchronize()
+        if snapshot_path is not None:
+            torch.cuda.memory._dump_snapshot(str(snapshot_path))
+    finally:
+        if snapshot_path is not None:
+            torch.cuda.memory._record_memory_history(enabled=None)
+
+    if not config.report_peak_memory:
+        return None
+
+    mib = 1024**2
+    return {
+        "peak_allocated_mb": torch.cuda.max_memory_allocated() / mib,
+        "peak_reserved_mb": torch.cuda.max_memory_reserved() / mib,
+    }
 
 
 def main() -> None:
@@ -205,11 +278,17 @@ def main() -> None:
     torch.manual_seed(config.seed)
 
     model = build_model(config)
+    optimizer = build_optimizer(model, config)
     batch = make_batch(config)
-    step_times = benchmark_steps(model, batch, config)
+    step_times = benchmark_steps(model, batch, config, optimizer)
     summary = summarize_timings(step_times)
+    memory_stats = maybe_profile_memory(model, batch, config, optimizer)
 
     print(summary)
+    if memory_stats is not None:
+        print(memory_stats)
+    if config.memory_snapshot_path is not None:
+        print({"memory_snapshot_path": config.memory_snapshot_path})
 
 
 if __name__ == "__main__":

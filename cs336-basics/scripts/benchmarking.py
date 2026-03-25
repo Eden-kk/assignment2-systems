@@ -8,19 +8,21 @@ yourself.
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import dataclass
-from typing import Literal
 import statistics
-
-from einops import rearrange
-import torch
 from timeit import default_timer
+from typing import Literal
+
+import torch
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 
 ModelSizeName = Literal["small", "medium", "large", "xl", "2.7B"]
 BenchmarkMode = Literal["forward", "forward-backward"]
+PrecisionName = Literal["float16", "float32", "bfloat16"]
+PrecisionAutocastName = Literal["none", "float16", "bfloat16"]
 
 
 @dataclass(frozen=True)
@@ -52,8 +54,16 @@ class BenchmarkConfig:
     measurement_steps: int
     mode: BenchmarkMode
     device: str
-    dtype: str
+    dtype: torch.dtype
+    precision_autocast: torch.dtype | None
     seed: int
+
+
+DTYPE_MAP: dict[PrecisionName, torch.dtype] = {
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,7 +79,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measurement-steps", type=int, default=10)
     parser.add_argument("--mode", choices=("forward", "forward-backward"), default="forward-backward")
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="float32")
+    parser.add_argument("--dtype", choices=tuple(DTYPE_MAP), default="float32")
+    parser.add_argument(
+        "--precision-autocast",
+        choices=("none", "float16", "bfloat16"),
+        default="none",
+        help="Autocast dtype for mixed precision. Keep model params in --dtype and cast eligible ops dynamically.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -85,9 +101,24 @@ def resolve_config(args: argparse.Namespace) -> BenchmarkConfig:
         measurement_steps=args.measurement_steps,
         mode=args.mode,
         device=args.device,
-        dtype=args.dtype,
+        dtype=DTYPE_MAP[args.dtype],
+        precision_autocast=None if args.precision_autocast == "none" else DTYPE_MAP[args.precision_autocast],
         seed=args.seed,
     )
+
+
+def synchronize(device: str) -> None:
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    elif device == "mps":
+        torch.mps.synchronize()
+
+
+def autocast_context(config: BenchmarkConfig) -> contextlib.AbstractContextManager[None]:
+    if config.precision_autocast is None:
+        return contextlib.nullcontext()
+    device_type = "cuda" if config.device.startswith("cuda") else config.device
+    return torch.autocast(device_type=device_type, dtype=config.precision_autocast)
 
 
 def build_model(config: BenchmarkConfig) -> BasicsTransformerLM:
@@ -111,8 +142,9 @@ def make_batch(config: BenchmarkConfig) -> torch.Tensor:
     batch = torch.randint(
         low=0,
         high=config.vocab_size,
-        size=(config.batch_size, config.context_length),
+        size=(config.batch_size, config.context_length + 1),
         device=config.device,
+        dtype=torch.long,
     )
     return batch
 
@@ -120,14 +152,19 @@ def make_batch(config: BenchmarkConfig) -> torch.Tensor:
 def run_step(model: BasicsTransformerLM, batch: torch.Tensor, config: BenchmarkConfig) -> None:
     """Run one benchmark step and synchronize CUDA after the step completes."""
     x, target = batch[..., :-1], batch[..., 1:]
-    logits = model(x)
-    if config.mode == "forward":
+
+    if config.mode == "forward-backward":
         model.zero_grad(set_to_none=True)
-        loss = cross_entropy(rearrange(logits, "... sequence_length vocab_size -> ... vocab_size sequence_length"), target)
+        with autocast_context(config):
+            logits = model(x)
+            loss = cross_entropy(logits, target)
         loss.backward()
-    
-    if "cuda" in config.device:
-        torch.cuda.synchronize()
+    else:
+        with torch.no_grad():
+            with autocast_context(config):
+                _ = model(x)
+
+    synchronize(config.device)
 
 
 def benchmark_steps(
@@ -140,17 +177,12 @@ def benchmark_steps(
         run_step(model, batch, config)
 
     step_times = []
-    
+
     for _ in range(config.measurement_steps):
-        if "cuda" in config.device:
-            torch.cuda.synchronize()
-        
+        synchronize(config.device)
         start = default_timer()
         run_step(model, batch, config)
-
-        if "cuda" in config.device:
-            torch.cuda.synchronize()
-        
+        synchronize(config.device)
         end = default_timer()
         step_times.append(end - start)
 

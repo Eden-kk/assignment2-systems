@@ -16,6 +16,7 @@ from timeit import default_timer
 from typing import Literal
 
 import torch
+import torch.nn as nn
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
@@ -270,6 +271,133 @@ def maybe_profile_memory(
         "peak_allocated_mb": torch.cuda.max_memory_allocated() / mib,
         "peak_reserved_mb": torch.cuda.max_memory_reserved() / mib,
     }
+
+
+def benchmark_model_variant(config: BenchmarkConfig, *, compile_model: bool) -> dict[str, float]:
+    """Benchmark one Transformer variant and return timing summary statistics."""
+    torch.manual_seed(config.seed)
+    model = build_model(config)
+    optimizer = build_optimizer(model, config)
+    if compile_model:
+        model = torch.compile(model)
+    batch = make_batch(config)
+    step_times = benchmark_steps(model, batch, config, optimizer)
+    return summarize_timings(step_times)
+
+
+def benchmark_attention_module(
+    module: nn.Module,
+    *,
+    batch_size: int,
+    seq_len: int,
+    d_model: int,
+    device: str,
+    dtype: torch.dtype,
+    warmup_steps: int,
+    measurement_steps: int,
+) -> dict[str, float]:
+    """Benchmark forward and backward for a single-head attention module."""
+    if not device.startswith("cuda"):
+        raise ValueError("Attention benchmarking currently expects a CUDA device.")
+
+    def make_inputs(*, requires_grad: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=requires_grad)
+        k = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=requires_grad)
+        v = torch.randn(batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=requires_grad)
+        return q, k, v
+
+    module = module.to(device)
+    module.eval()
+
+    q, k, v = make_inputs(requires_grad=False)
+    for _ in range(warmup_steps):
+        with torch.no_grad():
+            _ = module(q, k, v)
+        synchronize(device)
+
+    forward_times = []
+    for _ in range(measurement_steps):
+        synchronize(device)
+        start = default_timer()
+        with torch.no_grad():
+            _ = module(q, k, v)
+        synchronize(device)
+        forward_times.append(default_timer() - start)
+
+    torch.cuda.reset_peak_memory_stats()
+    q, k, v = make_inputs(requires_grad=True)
+    out = module(q, k, v)
+    synchronize(device)
+    memory_before_backward_mb = torch.cuda.memory_allocated() / (1024**2)
+    out.backward(torch.randn_like(out))
+    synchronize(device)
+
+    for _ in range(warmup_steps):
+        q, k, v = make_inputs(requires_grad=True)
+        out = module(q, k, v)
+        out.backward(torch.randn_like(out))
+        synchronize(device)
+
+    backward_times = []
+    for _ in range(measurement_steps):
+        q, k, v = make_inputs(requires_grad=True)
+        out = module(q, k, v)
+        grad = torch.randn_like(out)
+        synchronize(device)
+        start = default_timer()
+        out.backward(grad)
+        synchronize(device)
+        backward_times.append(default_timer() - start)
+
+    forward_summary = summarize_timings(forward_times)
+    backward_summary = summarize_timings(backward_times)
+    return {
+        "forward_mean_ms": 1000 * forward_summary["mean"],
+        "forward_stdev_ms": 1000 * forward_summary["stdev"],
+        "backward_mean_ms": 1000 * backward_summary["mean"],
+        "backward_stdev_ms": 1000 * backward_summary["stdev"],
+        "memory_before_backward_mb": memory_before_backward_mb,
+    }
+
+
+def safe_benchmark_attention_module(
+    module: nn.Module,
+    *,
+    batch_size: int,
+    seq_len: int,
+    d_model: int,
+    device: str,
+    dtype: torch.dtype,
+    warmup_steps: int,
+    measurement_steps: int,
+) -> dict[str, float | str | None]:
+    """Run the attention benchmark and surface OOMs as table rows."""
+    try:
+        return {
+            "status": "ok",
+            **benchmark_attention_module(
+                module,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                d_model=d_model,
+                device=device,
+                dtype=dtype,
+                warmup_steps=warmup_steps,
+                measurement_steps=measurement_steps,
+            ),
+        }
+    except RuntimeError as exc:
+        message = str(exc)
+        if "out of memory" in message.lower() or "no kernel image" in message.lower():
+            return {
+                "status": f"failed: {message}",
+                "forward_mean_ms": None,
+                "forward_stdev_ms": None,
+                "backward_mean_ms": None,
+                "backward_stdev_ms": None,
+                "memory_before_backward_mb": None,
+            }
+        raise
 
 
 def main() -> None:

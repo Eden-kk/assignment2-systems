@@ -260,11 +260,7 @@ if HAS_TRITON:
                 q_idx = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
                 k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
                 mask = q_idx[:, None] >= k_idx[None, :]
-                s_i_j = s_i_j + tl.where(
-                    mask, 
-                    tl.zeros_like(s_i_j),
-                    tl.full_like(s_i_j, -1e6),
-                )
+                s_i_j = s_i_j + tl.where(mask, 0.0, -1e6)
             m_i_j = tl.maximum(m_i_j_old, tl.max(s_i_j, axis=1))        
             p_i_j = tl.exp(s_i_j - m_i_j[:, None])
             l_i_j = tl.exp(m_i_j_old - m_i_j) * l_i_j_old + tl.sum(p_i_j, axis=1)

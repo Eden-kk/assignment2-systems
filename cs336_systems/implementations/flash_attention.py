@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from einops import einsum
-from sympy.simplify.fu import L
 import torch
 
 try:
@@ -149,8 +148,54 @@ class FlashAttention2PyTorch(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        # The assignment explicitly allows backward to be unimplemented at first.
-        raise NotImplementedError("Implement backward after you finish the forward-pass skeleton.")
+        l, q, k, v, o = ctx.saved_tensors
+        D = torch.sum(o * grad_output, dim=-1)
+        batch_size = grad_output.shape[0]
+        n_queries = q.shape[-2]
+        n_keys = k.shape[-2]
+
+        grad_q = torch.zeros_like(q, dtype=torch.float32)
+        grad_k = torch.zeros_like(k, dtype=torch.float32)
+        grad_v = torch.zeros_like(v, dtype=torch.float32)
+
+        for b in range(batch_size):
+            for i in range(0, n_queries, ctx.q_tile_size):
+                q_i = q[b, i:i+ctx.q_tile_size, :]
+                grad_o_i = grad_output[b, i:i+ctx.q_tile_size, :]
+                l_i = l[b, i:i+ctx.q_tile_size]
+                D_i = D[b, i:i+ctx.q_tile_size]
+
+                grad_q_i = torch.zeros_like(q_i, dtype=torch.float32)
+
+                for j in range(0, n_keys, ctx.k_tile_size):
+                    k_j = k[b, j:j+ctx.k_tile_size, :]
+                    v_j = v[b, j:j+ctx.k_tile_size, :]
+
+                    s_i_j = q_i.to(torch.float32) @ k_j.to(torch.float32).transpose(0, 1) * ctx.scale
+       
+                    # mask if causal attention
+                    if ctx.is_causal:
+                        q_idx = i + torch.arange(q_i.shape[0], device=q.device)
+                        k_idx = j + torch.arange(k_j.shape[0], device=k.device)
+                        mask = q_idx[:, None] >= k_idx[None, :]
+                        s_i_j = s_i_j + torch.where(
+                            mask,
+                            torch.zeros_like(s_i_j),
+                            torch.full_like(s_i_j, -1e6),
+                        )
+
+                    p_i_j = torch.exp(s_i_j - l_i.unsqueeze(-1))
+
+                    grad_p_i_j = grad_o_i @ v_j.transpose(0, 1)
+                    grad_s_i_j = p_i_j * (grad_p_i_j - D_i.unsqueeze(-1))
+
+                    grad_v[b, j:j+ctx.k_tile_size, :] += p_i_j.transpose(0, 1) @ grad_o_i
+                    grad_k[b, j:j+ctx.k_tile_size, :] += grad_s_i_j.transpose(0, 1) @ q_i * ctx.scale
+                    grad_q_i += grad_s_i_j @ k_j * ctx.scale
+                    
+                grad_q[b, i:i+ctx.q_tile_size, : ] = grad_q_i
+
+        return grad_q.to(q.dtype), grad_k.to(k.dtype), grad_v.to(v.dtype), None
 
 
 if HAS_TRITON:

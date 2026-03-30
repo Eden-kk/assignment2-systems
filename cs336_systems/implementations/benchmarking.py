@@ -13,14 +13,16 @@ from dataclasses import dataclass
 from pathlib import Path
 import statistics
 from timeit import default_timer
-from typing import Literal
+from typing import Callable, Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
+from cs336_systems.implementations.flash_attention import FlashAttention2PyTorch, FlashAttention2Triton
 
 ModelSizeName = Literal["small", "medium", "large", "xl", "2.7B"]
 BenchmarkMode = Literal["forward", "forward-backward", "train-step"]
@@ -358,6 +360,96 @@ def benchmark_attention_module(
         "backward_stdev_ms": 1000 * backward_summary["stdev"],
         "memory_before_backward_mb": memory_before_backward_mb,
     }
+
+
+class FlashAttentionAutogradModule(nn.Module):
+    """Thin module wrapper so autograd.Function implementations fit the benchmark helper."""
+
+    def __init__(self, flash_attention_impl: type[torch.autograd.Function], *, is_causal: bool = False) -> None:
+        super().__init__()
+        self.flash_attention_impl = flash_attention_impl
+        self.is_causal = is_causal
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return self.flash_attention_impl.apply(q, k, v, self.is_causal)
+
+
+class ScaledDotProductAttentionBaseline(nn.Module):
+    """Single-head wrapper around torch.nn.functional.scaled_dot_product_attention."""
+
+    def __init__(self, *, is_causal: bool = False) -> None:
+        super().__init__()
+        self.is_causal = is_causal
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        q_heads = q.unsqueeze(1)
+        k_heads = k.unsqueeze(1)
+        v_heads = v.unsqueeze(1)
+        out = F.scaled_dot_product_attention(
+            q_heads,
+            k_heads,
+            v_heads,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=self.is_causal,
+        )
+        return out.squeeze(1)
+
+
+def make_flash_attention_benchmark_modules(*, is_causal: bool) -> dict[str, nn.Module]:
+    """Build the attention variants needed for Problem (flash_benchmarking)."""
+    return {
+        "sdpa_baseline": ScaledDotProductAttentionBaseline(is_causal=is_causal),
+        "flash_attention_pytorch": FlashAttentionAutogradModule(
+            FlashAttention2PyTorch,
+            is_causal=is_causal,
+        ),
+        "flash_attention_triton": FlashAttentionAutogradModule(
+            FlashAttention2Triton,
+            is_causal=is_causal,
+        ),
+    }
+
+
+def benchmark_flash_attention_variants(
+    *,
+    batch_size: int,
+    seq_len: int,
+    d_model: int,
+    device: str,
+    dtype: torch.dtype,
+    warmup_steps: int,
+    measurement_steps: int,
+    is_causal: bool,
+) -> list[dict[str, float | str | None]]:
+    """Skeleton entrypoint for the handout's flash attention benchmarking problem."""
+    rows: list[dict[str, float | str | None]] = []
+
+    for name, module in make_flash_attention_benchmark_modules(is_causal=is_causal).items():
+        result = safe_benchmark_attention_module(
+            module,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            d_model=d_model,
+            device=device,
+            dtype=dtype,
+            warmup_steps=warmup_steps,
+            measurement_steps=measurement_steps,
+        )
+        rows.append(
+            {
+                "impl": name,
+                "is_causal": is_causal,
+                "batch_size": batch_size,
+                "d_model": d_model,
+                "sequence_length": seq_len,
+                "device": device,
+                "dtype": str(dtype),
+                **result,
+            }
+        )
+
+    return rows
 
 
 def safe_benchmark_attention_module(

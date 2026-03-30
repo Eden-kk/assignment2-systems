@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from einops import einsum
 import torch
+from torch._dynamo.symbolic_convert import tls
 
 try:
     import triton
@@ -46,7 +47,7 @@ class FlashAttention2PyTorch(torch.autograd.Function):
         v: torch.Tensor,
         is_causal: bool = False,
     ) -> torch.Tensor:
-        batch_size, n_queries, _n_keys, d_model = _validate_flash_inputs(q, k, v)
+        batch_size, n_queries, n_keys, d_model = _validate_flash_inputs(q, k, v)
 
         q_tile_size = DEFAULT_Q_TILE_SIZE
         k_tile_size = DEFAULT_K_TILE_SIZE
@@ -100,7 +101,7 @@ class FlashAttention2PyTorch(torch.autograd.Function):
                     device=q.device,
                     dtype=torch.float32,
                 )
-                for j in range(0, _n_keys, k_tile_size):
+                for j in range(0, n_keys, k_tile_size):
                     k_j = k[b, j:j+k_tile_size, :]
                     v_j = v[b, j:j+k_tile_size, :]
                     s_i_j = einsum(
@@ -150,9 +151,7 @@ class FlashAttention2PyTorch(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         l, q, k, v, o = ctx.saved_tensors
         D = torch.sum(o * grad_output, dim=-1)
-        batch_size = grad_output.shape[0]
-        n_queries = q.shape[-2]
-        n_keys = k.shape[-2]
+        batch_size, n_queries, n_keys, _ = _validate_flash_inputs(q, k, v)
 
         grad_q = torch.zeros_like(q, dtype=torch.float32)
         grad_k = torch.zeros_like(k, dtype=torch.float32)
@@ -168,15 +167,15 @@ class FlashAttention2PyTorch(torch.autograd.Function):
                 grad_q_i = torch.zeros_like(q_i, dtype=torch.float32)
 
                 for j in range(0, n_keys, ctx.k_tile_size):
-                    k_j = k[b, j:j+ctx.k_tile_size, :]
-                    v_j = v[b, j:j+ctx.k_tile_size, :]
+                    k_i_j = k[b, j:j+ctx.k_tile_size, :]
+                    v_i_j = v[b, j:j+ctx.k_tile_size, :]
 
-                    s_i_j = q_i.to(torch.float32) @ k_j.to(torch.float32).transpose(0, 1) * ctx.scale
+                    s_i_j = q_i.to(torch.float32) @ k_j.to(torch.float32).transpose(-2, -1) * ctx.scale
        
                     # mask if causal attention
                     if ctx.is_causal:
                         q_idx = i + torch.arange(q_i.shape[0], device=q.device)
-                        k_idx = j + torch.arange(k_j.shape[0], device=k.device)
+                        k_idx = j + torch.arange(k_i_j.shape[0], device=k.device)
                         mask = q_idx[:, None] >= k_idx[None, :]
                         s_i_j = s_i_j + torch.where(
                             mask,
@@ -186,12 +185,12 @@ class FlashAttention2PyTorch(torch.autograd.Function):
 
                     p_i_j = torch.exp(s_i_j - l_i.unsqueeze(-1))
 
-                    grad_p_i_j = grad_o_i @ v_j.transpose(0, 1)
+                    grad_p_i_j = grad_o_i @ v_i_j.transpose(-2, -1)
                     grad_s_i_j = p_i_j * (grad_p_i_j - D_i.unsqueeze(-1))
 
-                    grad_v[b, j:j+ctx.k_tile_size, :] += p_i_j.transpose(0, 1) @ grad_o_i
-                    grad_k[b, j:j+ctx.k_tile_size, :] += grad_s_i_j.transpose(0, 1) @ q_i * ctx.scale
-                    grad_q_i += grad_s_i_j @ k_j * ctx.scale
+                    grad_v[b, j:j+ctx.k_tile_size, :] += p_i_j.transpose(-2, -1) @ grad_o_i
+                    grad_k[b, j:j+ctx.k_tile_size, :] += grad_s_i_j.transpose(-2, -1) @ q_i * ctx.scale
+                    grad_q_i += grad_s_i_j @ k_i_j * ctx.scale
                     
                 grad_q[b, i:i+ctx.q_tile_size, : ] = grad_q_i
 
@@ -297,9 +296,9 @@ if HAS_TRITON:
         #   6. Advance K/V block pointers to the next tile
         #
         for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
-            k_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            v_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            s_i_j = tl.dot(q_i, tl.trans(k_j)) * scale
+            k_i_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            v_i_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            s_i_j = tl.dot(q_i, tl.trans(k_i_j)) * scale
             # mask if is_casual == True
             if is_causal:
                 q_idx = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
@@ -309,7 +308,7 @@ if HAS_TRITON:
             m_i_j = tl.maximum(m_i_j_old, tl.max(s_i_j, axis=1))        
             p_i_j = tl.exp(s_i_j - m_i_j[:, None])
             l_i_j = tl.exp(m_i_j_old - m_i_j) * l_i_j_old + tl.sum(p_i_j, axis=1)
-            o_i_j = tl.exp(m_i_j_old - m_i_j)[:, None] * o_i_j_old + tl.dot(p_i_j, v_j)
+            o_i_j = tl.exp(m_i_j_old - m_i_j)[:, None] * o_i_j_old + tl.dot(p_i_j, v_i_j)
 
             m_i_j_old = m_i_j
             l_i_j_old = l_i_j
@@ -326,9 +325,289 @@ if HAS_TRITON:
         tl.store(O_block_ptr, o_i, boundary_check=(0, 1))
         tl.store(L_block_ptr, l_i, boundary_check=(0,))
 
+    @triton.jit
+    def flash_bwd_grad_q_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        L_ptr,
+        Grad_Output_ptr,
+        D_Sum_ptr,
+        Grad_Q_ptr,
+        stride_qb,
+        stride_qq,
+        stride_qd,
+        stride_kb,
+        stride_kk,
+        stride_kd,
+        stride_vb,
+        stride_vk,
+        stride_vd,
+        stride_ob,
+        stride_oq,
+        stride_od,
+        stride_lb,
+        stride_lq,
+        stride_db,
+        stride_dq,
+        N_QUERIES,
+        N_KEYS,
+        scale,
+        is_causal: tl.constexpr,
+        D: tl.constexpr,
+        Q_TILE_SIZE: tl.constexpr,
+        K_TILE_SIZE: tl.constexpr,
+    ):
+        query_tile_index = tl.program_id(0)
+        batch_index = tl.program_id(1)
+
+        Q_block_ptr = tl.make_block_ptr(
+            Q_ptr + batch_index * stride_qb,
+            shape=(N_QUERIES, D),
+            strides=(stride_qq, stride_qd),
+            offsets=(query_tile_index * Q_TILE_SIZE, 0),
+            block_shape=(Q_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        K_block_ptr = tl.make_block_ptr(
+            K_ptr + batch_index * stride_kb,
+            shape=(N_KEYS, D),
+            strides=(stride_kk, stride_kd),
+            offsets=(0, 0),
+            block_shape=(K_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        V_block_ptr = tl.make_block_ptr(
+            V_ptr + batch_index * stride_vb,
+            shape=(N_KEYS, D),
+            strides=(stride_vk, stride_vd),
+            offsets=(0, 0),
+            block_shape=(K_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        L_block_ptr = tl.make_block_ptr(
+            L_ptr + batch_index * stride_lb,
+            shape=(N_QUERIES,),
+            strides=(stride_lq,),
+            offsets=(query_tile_index * Q_TILE_SIZE,),
+            block_shape=(Q_TILE_SIZE,),
+            order=(0,),
+        )
+
+        Grad_Output_block_ptr = tl.make_block_ptr(
+            Grad_Output_ptr + batch_index * stride_ob,
+            shape=(N_QUERIES, D),
+            strides=(stride_oq, stride_od),
+            offsets=(query_tile_index * Q_TILE_SIZE, 0),
+            block_shape=(Q_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        D_Sum_block_ptr = tl.make_block_ptr(
+            D_Sum_ptr + batch_index * stride_db,
+            shape=(N_QUERIES,),
+            strides=(stride_dq,),
+            offsets=(query_tile_index * Q_TILE_SIZE,),
+            block_shape=(Q_TILE_SIZE,),
+            order=(0,),
+        )
+
+        Grad_Q_block_ptr = tl.make_block_ptr(
+            Grad_Q_ptr + batch_index * stride_qb,
+            shape=(N_QUERIES, D),
+            strides=(stride_qq, stride_qd),
+            offsets=(query_tile_index * Q_TILE_SIZE, 0),
+            block_shape=(Q_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        q_i = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        grad_q_i = tl.load(Grad_Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        grad_o_i = tl.load(Grad_Output_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        l_i = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
+        D_Sum_i = tl.load(D_Sum_block_ptr, boundary_check=(0,), padding_option="zero")
+
+        for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+            k_i_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            v_i_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+            s_i_j = tl.dot(q_i, tl.trans(k_i_j)) * scale
+
+            # mask if causal attention
+            if is_causal:
+                q_idx = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+                k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+                mask = q_idx[:, None] >= k_idx[None, :]
+                s_i_j = s_i_j + tl.where(mask, 0.0, -1e6)
+
+            p_i_j = tl.exp(s_i_j - l_i.unsqueeze(-1))
+           
+            grad_p_i_j = tl.dot(grad_o_i, tl.trans(v_i_j))
+            grad_s_i_j = p_i_j * (grad_p_i_j - D_Sum_i.unsqueeze(-1))
+            grad_q_i += tl.dot(grad_s_i_j, k_i_j) * scale
+
+            K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+            V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+        
+        tl.store(Grad_Q_block_ptr, grad_q_i, boundary_check=(0, 1))
+
+    @triton.jit
+    def flash_bwd_grad_k_and_grad_v_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        L_ptr,
+        Grad_Output_ptr,
+        D_Sum_ptr,
+        Grad_K_ptr,
+        Grad_V_ptr,
+        stride_qb,
+        stride_qq,
+        stride_qd,
+        stride_kb,
+        stride_kk,
+        stride_kd,
+        stride_vb,
+        stride_vk,
+        stride_vd,
+        stride_ob,
+        stride_oq,
+        stride_od,
+        stride_lb,
+        stride_lq,
+        stride_db,
+        stride_dq,
+        N_QUERIES,
+        N_KEYS,
+        scale,
+        is_causal: tl.constexpr,
+        D: tl.constexpr,
+        Q_TILE_SIZE: tl.constexpr,
+        K_TILE_SIZE: tl.constexpr,
+    ):
+        key_tile_index = tl.program_id(0)
+        batch_index = tl.program_id(1)
+
+        Q_block_ptr = tl.make_block_ptr(
+            Q_ptr + batch_index * stride_qb,
+            shape=(N_QUERIES, D),
+            strides=(stride_qq, stride_qd),
+            offsets=(0, 0),
+            block_shape=(Q_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        K_block_ptr = tl.make_block_ptr(
+            K_ptr + batch_index * stride_kb,
+            shape=(N_KEYS, D),
+            strides=(stride_kk, stride_kd),
+            offsets=(key_tile_index * K_TILE_SIZE, 0),
+            block_shape=(K_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        V_block_ptr = tl.make_block_ptr(
+            V_ptr + batch_index * stride_vb,
+            shape=(N_KEYS, D),
+            strides=(stride_vk, stride_vd),
+            offsets=(key_tile_index * K_TILE_SIZE, 0),
+            block_shape=(K_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        L_block_ptr = tl.make_block_ptr(
+            L_ptr + batch_index * stride_lb,
+            shape=(N_QUERIES,),
+            strides=(stride_lq,),
+            offsets=(0,),
+            block_shape=(Q_TILE_SIZE,),
+            order=(0,),
+        )
+
+        Grad_Output_block_ptr = tl.make_block_ptr(
+            Grad_Output_ptr + batch_index * stride_ob,
+            shape=(N_QUERIES, D),
+            strides=(stride_oq, stride_od),
+            offsets=(0, 0),
+            block_shape=(Q_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        D_Sum_block_ptr = tl.make_block_ptr(
+            D_Sum_ptr + batch_index * stride_db,
+            shape=(N_QUERIES,),
+            strides=(stride_dq,),
+            offsets=(0,),
+            block_shape=(Q_TILE_SIZE,),
+            order=(0,),
+        )
+
+        Grad_K_block_ptr = tl.make_block_ptr(
+            Grad_K_ptr + batch_index * stride_kb,
+            shape=(N_KEYS, D),
+            strides=(stride_kk, stride_kd),
+            offsets=(key_tile_index * K_TILE_SIZE, 0),
+            block_shape=(K_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        Grad_V_block_ptr = tl.make_block_ptr(
+            Grad_V_ptr + batch_index * stride_vb,
+            shape=(N_KEYS, D),
+            strides=(stride_vk, stride_vd),
+            offsets=(key_tile_index * K_TILE_SIZE, 0),
+            block_shape=(K_TILE_SIZE, D),
+            order=(1, 0),
+        )
+
+        k_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        v_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        grad_k_j = tl.load(Grad_K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        grad_v_j = tl.load(Grad_V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        for i in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
+            q_i = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            grad_o_i = tl.load(Grad_Output_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            l_i = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
+            D_Sum_i = tl.load(D_Sum_block_ptr, boundary_check=(0,), padding_option="zero")
+            s_i_j = tl.dot(q_i, tl.trans(k_j)) * scale
+
+            # mask if causal attention
+            if is_causal:
+                q_idx = i * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+                k_idx = key_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+                mask = q_idx[:, None] >= k_idx[None, :]
+                s_i_j = s_i_j + tl.where(mask, 0.0, -1e6)
+
+            p_i_j = tl.exp(s_i_j - l_i.unsqueeze(-1))
+           
+            grad_p_i_j = tl.dot(grad_o_i, tl.trans(v_j))
+            grad_s_i_j = p_i_j * (grad_p_i_j - D_Sum_i.unsqueeze(-1))
+            grad_v_j += tl.dot(tl.trans(p_i_j), grad_o_i)
+            grad_k_j += tl.dot(tl.trans(grad_s_i_j), q_i) * scale
+
+            Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+            Grad_Output_block_ptr = Grad_Output_block_ptr.advance((Q_TILE_SIZE, 0))
+            L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+            D_Sum_block_ptr = D_Sum_block_ptr.advance((Q_TILE_SIZE,))
+        
+        tl.store(Grad_K_block_ptr, grad_k_j, boundary_check=(0, 1))
+        tl.store(Grad_V_block_ptr, grad_v_j, boundary_check=(0, 1))
+
 else:
 
     def flash_fwd_kernel(*args, **kwargs):
+        raise RuntimeError("Triton is not available in this environment.")
+
+    def flash_bwd_grad_q_kernel(*args, **kwargs):
+        raise RuntimeError("Triton is not available in this environment.")
+    
+    def flash_bwd_grad_k_and_grad_v_kernel(*args, **kwargs):
         raise RuntimeError("Triton is not available in this environment.")
 
 
@@ -385,7 +664,55 @@ class FlashAttention2Triton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        raise NotImplementedError("Backward Triton kernel skeleton intentionally left unimplemented.")
+        l, q, k, v, o = ctx.saved_tensors
+        D_sum = torch.sum(o * grad_output, dim=-1)
+        batch_size, n_queries, n_keys, d_model = _validate_flash_inputs(q, k, v)
+
+        grad_q = torch.zeros_like(q, dtype=torch.float32)
+        grad_k = torch.zeros_like(k, dtype=torch.float32)
+        grad_v = torch.zeros_like(v, dtype=torch.float32)
+
+        q_tile_size = DEFAULT_Q_TILE_SIZE
+        k_tile_size = DEFAULT_K_TILE_SIZE
+        scale = 1.0 / math.sqrt(d_model)
+
+        grid_q = (triton.cdiv(n_queries, q_tile_size), batch_size)
+        grid_k = (triton.cdiv(n_keys, k_tile_size), batch_size)
+
+        flash_bwd_grad_q_kernel[grid_q](
+            q, k, v, o, l, grad_output, D_sum, 
+            grad_q,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            o.stride(0), o.stride(1), o.stride(2),
+            l.stride(0), l.stride(1),
+            D_sum.stride(0), D_sum.stride(1),
+            n_queries, n_keys, scale, 
+            is_causal=ctx.is_causal,
+            D=d_model,
+            Q_TILE_SIZE=q_tile_size,
+            K_TILE_SIZE=k_tile_size,
+        )
+
+        flash_bwd_grad_k_and_grad_v_kernel[grid_k](
+            q, k, v, o, l, grad_output, D_sum, 
+            grad_k, grad_v,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            o.stride(0), o.stride(1), o.stride(2),
+            l.stride(0), l.stride(1),
+            D_sum.stride(0), D_sum.stride(1),
+            n_queries, n_keys, scale, 
+            is_causal=ctx.is_causal,
+            D=d_model,
+            Q_TILE_SIZE=q_tile_size,
+            K_TILE_SIZE=k_tile_size,
+        )
+
+        return grad_q, grad_k, grad_v, None
+
 
 
 __all__ = [

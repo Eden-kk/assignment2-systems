@@ -11,6 +11,7 @@ import argparse
 import contextlib
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 import statistics
 from timeit import default_timer
 from typing import Callable, Literal
@@ -19,9 +20,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cs336_basics.model import BasicsTransformerLM
-from cs336_basics.nn_utils import cross_entropy
-from cs336_basics.optimizer import AdamW
+try:
+    from cs336_basics.model import BasicsTransformerLM
+    from cs336_basics.nn_utils import cross_entropy
+    from cs336_basics.optimizer import AdamW
+except ModuleNotFoundError:
+    repo_root = Path(__file__).resolve().parents[2]
+    basics_root = repo_root / "cs336-basics"
+    if str(basics_root) not in sys.path:
+        sys.path.insert(0, str(basics_root))
+    from cs336_basics.model import BasicsTransformerLM
+    from cs336_basics.nn_utils import cross_entropy
+    from cs336_basics.optimizer import AdamW
 from cs336_systems.implementations.flash_attention import FlashAttention2PyTorch, FlashAttention2Triton
 
 ModelSizeName = Literal["small", "medium", "large", "xl", "2.7B"]
